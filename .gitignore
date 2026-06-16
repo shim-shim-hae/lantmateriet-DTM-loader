@@ -1,0 +1,19 @@
+node_modules/
+
+# downloaded tiles (default output directories)
+output/
+downloads/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+*.swp
