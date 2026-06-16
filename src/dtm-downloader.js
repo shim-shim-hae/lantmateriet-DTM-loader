@@ -13,6 +13,10 @@ const GRID_COORDINATE_EPSILON = 1e-12;
 const QUERY_DELAY_MS = 1000;
 const QUERY_RETRY_LIMIT = 3;
 const QUERY_RETRY_BASE_DELAY_MS = 2000;
+const DOWNLOAD_CONCURRENCY = 4;
+const DOWNLOAD_RETRY_LIMIT = 3;
+const DOWNLOAD_RETRY_DELAY_MS = 3000;
+const RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED']);
 const TILE_URL_MANIFEST_FILENAME = 'dtm-tile-urls.json';
 const DOWNLOAD_MANIFEST_FILENAME = 'dtm-download-manifest.json';
 
@@ -86,6 +90,21 @@ function delay(ms) {
   });
 }
 
+async function withConcurrency(limit, items, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 function writeJsonFile(filePath, payload) {
   return fs.promises.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`);
 }
@@ -137,9 +156,20 @@ function readGeoJsonPolygon(filePath) {
     fail(`GeoJSON file is not valid JSON: ${resolvedPath}. ${error.message}`);
   }
 
-  const geometry = geojson.type === 'Feature' ? geojson.geometry : geojson;
+  let feature = geojson;
+  if (geojson.type === 'FeatureCollection') {
+    if (!Array.isArray(geojson.features) || geojson.features.length === 0) {
+      fail('GeoJSON FeatureCollection contains no features.');
+    }
+    if (geojson.features.length > 1) {
+      console.error(`Warning: GeoJSON FeatureCollection has ${geojson.features.length} features; using the first one.`);
+    }
+    feature = geojson.features[0];
+  }
+
+  const geometry = feature.type === 'Feature' ? feature.geometry : feature;
   if (!geometry || geometry.type !== 'Polygon') {
-    fail('GeoJSON input must be a Feature with Polygon geometry or a bare Polygon geometry.');
+    fail('GeoJSON input must be a Polygon feature (or a FeatureCollection containing one).');
   }
 
   if (!Array.isArray(geometry.coordinates) || geometry.coordinates.length === 0) {
@@ -419,27 +449,34 @@ async function downloadTile(url, directory) {
   const filename = filenameFromUrl(url);
   const destination = path.resolve(directory, filename);
 
-  try {
-    const response = await axios.get(url, { responseType: 'stream', auth: credentials });
-    const totalBytes = Number(response.headers['content-length']) || 0;
-    let downloadedBytes = 0;
-    const logProgress = createProgressLogger(filename, totalBytes);
+  for (let attempt = 0; attempt <= DOWNLOAD_RETRY_LIMIT; attempt += 1) {
+    try {
+      const response = await axios.get(url, { responseType: 'stream', auth: credentials });
+      const totalBytes = Number(response.headers['content-length']) || 0;
+      let downloadedBytes = 0;
+      const logProgress = createProgressLogger(filename, totalBytes);
 
-    logProgress(downloadedBytes, true);
-    response.data.on('data', (chunk) => {
-      downloadedBytes += chunk.length;
-      logProgress(downloadedBytes);
-    });
+      logProgress(downloadedBytes, true);
+      response.data.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        logProgress(downloadedBytes);
+      });
 
-    await pipeline(response.data, fs.createWriteStream(destination));
-    logProgress(downloadedBytes, true);
-    console.error(`Finished ${filename}`);
+      await pipeline(response.data, fs.createWriteStream(destination));
+      logProgress(downloadedBytes, true);
+      console.error(`Finished ${filename}`);
 
-    return { ok: true, url, path: destination };
-  } catch (error) {
-    const status = error.response?.status ? `HTTP ${error.response.status}: ` : '';
-    console.error(`Failed to download ${url}: ${status}${error.message}`);
-    return { ok: false, url, error: `${status}${error.message}` };
+      return { ok: true, url, path: destination };
+    } catch (error) {
+      if (RETRYABLE_ERROR_CODES.has(error.code) && attempt < DOWNLOAD_RETRY_LIMIT) {
+        console.error(`${filename}: ${error.code}, retrying (${attempt + 1}/${DOWNLOAD_RETRY_LIMIT})...`);
+        await delay(DOWNLOAD_RETRY_DELAY_MS);
+      } else {
+        const status = error.response?.status ? `HTTP ${error.response.status}: ` : '';
+        console.error(`Failed to download ${url}: ${status}${error.message}`);
+        return { ok: false, url, error: `${status}${error.message}` };
+      }
+    }
   }
 }
 
@@ -451,7 +488,7 @@ async function downloadTiles(urls, directory) {
   await writeJsonFile(tileUrlManifestPath, { dtm_tiles: urls });
   console.error(`Saved tile URL list to ${tileUrlManifestPath}`);
 
-  const results = await Promise.all(urls.map((url) => downloadTile(url, resolvedDirectory)));
+  const results = await withConcurrency(DOWNLOAD_CONCURRENCY, urls, (url) => downloadTile(url, resolvedDirectory));
   const downloaded = results.filter((result) => result.ok).map((result) => result.path);
   const failed = results.filter((result) => !result.ok);
 
