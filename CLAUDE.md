@@ -1,52 +1,65 @@
-# Bounding box DTM downloader for the Swedish DTM
-This app downloads the Swedish DTM within a specified geometry. The app takes a GeoJSON polygon as input and returns DTM tiles for that area.
+# Lantmäteriet DTM Loader — codebase notes
 
-## Swedish Lantmäteriet API for DTM data
-The app uses the Swedish Lantmäteriet API to download the DTM data.
+Single-file Node.js CLI tool. All logic lives in `src/dtm-downloader.js`. No build step; run directly with `node`.
 
-The API is a STAC API available at the following URL:  
-https://api.lantmateriet.se/stac-hojd/v1/
+## Dependencies
 
-The search endpoint is at:  
-https://api.lantmateriet.se/stac-hojd/v1/search
+| Package | Purpose |
+|---------|---------|
+| `axios` | HTTP requests (STAC API + tile downloads) |
+| `dotenv` | Load `LM_USERNAME` / `LM_PASSWORD` from `.env` |
+| `@turf/turf` | Geodesic distance for 10×10 km grid subdivision |
 
-API documentation can be found at the following URL:  
-https://api.lantmateriet.se/stac-hojd/v1/api.html
+## Credentials
 
-## Environment
-The app is built using Node.js and uses the 'axios' library to make HTTP requests to the API. The app also uses the 'fs' library to save the downloaded DTM tiles to the user's computer. For authentication, the app uses the 'dotenv' library to load environment variables. For GeoJSON processing, the app uses the 'Turf.js' library. The app can be run in a terminal or command prompt.
+Downloaded from `dl1.lantmateriet.se` using HTTP Basic Auth. Credentials come from `LM_USERNAME` and `LM_PASSWORD` env vars (loaded from `.env` via dotenv). The STAC search API is public and needs no auth.
 
-## Input
-Input to the app is a polygon in GeoJSON format defined by the coordinates of its vertices. WGS84 coordinate system is used (EPSG:4326).
+## Input modes
 
-## Polygon handling
-The app uses the 'Turf.js' library to break up the GeoJSON polygon into 10x10 km non-overlapping bounding boxes. The bounding boxes are used to query the API for DTM tiles that intersect with the bounding box.
+### Bbox mode
+`node src/dtm-downloader.js min_lon,min_lat,max_lon,max_lat`  
+Parses four comma-separated WGS84 values, queries the STAC API once.
 
-## API response
-The API response is a JSON listing 'collections' of DTM tiles that contain the respective bounding box and 'assets', i.e. the actual DTM tiles within the bounding box.
-The download URL is under feature.assets.data.href in the API response and has the following format:  
-https://dl1.lantmateriet.se/hojd/data/grid1m/xxx.tif  
-where 'xxx' is the tile name, e.g. '65875_6750_25.tif'.
+### GeoJSON mode
+`node src/dtm-downloader.js --geojson path/to/polygon.geojson`  
+Accepts `FeatureCollection`, `Feature`, or bare `Polygon` geometry (handles ArcGIS Pro exports which wrap in a FeatureCollection). If a FeatureCollection has multiple features, the first is used with a warning.
 
-## Output
-The app saves a list of download URLs for the DTM tiles that intersect with each input bounding box. Any duplicate URLs are removed. The list is in JSON format, specifying bounding box and download URLs, for example:
+## Grid subdivision (GeoJSON mode)
 
-{  
-    "bounding box_xxx":  
-    [  
-    "https://dl1.lantmateriet.se/hojd/data/grid1m/65_6/55/65875_6750_25.tif",  
-    "https://dl1.lantmateriet.se/hojd/data/grid1m/65_6/55/65875_6750_26.tif"
-    ]  
-}  
+`subdividePolygonBbox` tiles the polygon's bounding box into 10×10 km cells. Cell size is computed geodesically via `turf.destination` (not a fixed degree offset) so the metric size is correct at any latitude. Cells are queried sequentially with a 1-second delay between requests to avoid rate limiting.
 
-Then the app calculates the total size of the DTM tiles to be downloaded (in GB, tile size times number of tiles) and asks the user if they want to download the tiles. If the user confirms, the app will download the DTM tiles and save them to a specified directory on the user's computer. Download progress is displayed on a bounding box level as a progress bar. Index number of the currently downloading BB and total number of BBs is shown, e.g., "Downloading BB 2 of 5...".
-The app will also handle any errors that may occur during the download process, such as network issues or invalid URLs, and will provide appropriate feedback to the user.
-The app will also save a manifest file listing the file paths of the downloaded DTM tiles in JSON format, for example:
+## STAC API
 
-{  
-  "bb_xxx_downloaded_tiles":  
-  [  
-    "/path/to/downloaded/65875_6750_25.tif",  
-    "/path/to/downloaded/65875_6750_26.tif"  
-  ]  
-}
+- Search endpoint: `https://api.lantmateriet.se/stac-hojd/v1/search`
+- POST with `{ bbox }` body; pagination follows STAC `next` links
+- A `next` link with `method: GET` is followed as a GET request; all others as POST
+- HTTP 429 responses are retried up to 3 times, honouring `Retry-After` if present
+
+## Asset filtering
+
+Only assets whose `href` matches `/\/data\/grid1m\//` are kept. This excludes lower-resolution `grid/` assets and `pointcloud/` assets.
+
+## Download behaviour
+
+- `DOWNLOAD_CONCURRENCY = 4` — worker-pool pattern, not `Promise.all`
+- `ECONNRESET`, `ETIMEDOUT`, `ECONNABORTED` are retried up to 3 times with a 3-second delay
+- Other errors (HTTP 4xx/5xx) fail immediately
+- `stdout` receives only JSON; all progress and errors go to `stderr`
+
+## Output files (written to the user-chosen download directory)
+
+| File | Contents |
+|------|---------|
+| `dtm-tile-urls.json` | Full deduplicated list of tile URLs found |
+| `dtm-download-manifest.json` | Successfully downloaded paths + any per-tile errors |
+
+## Key constants (top of file)
+
+```
+GRID_CELL_SIZE_KM          10
+QUERY_DELAY_MS             1000   between grid-cell STAC requests
+QUERY_RETRY_LIMIT          3      STAC HTTP 429 retries
+DOWNLOAD_CONCURRENCY       4      parallel tile downloads
+DOWNLOAD_RETRY_LIMIT       3      per-tile connection-error retries
+DOWNLOAD_RETRY_DELAY_MS    3000
+```
